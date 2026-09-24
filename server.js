@@ -1,6 +1,10 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const dns = require('dns');
+
+// Ép Node.js ưu tiên phân giải tên miền qua IPv4 (Sửa triệt để lỗi ENOTFOUND trên Render)
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 app.use(cors());
@@ -12,14 +16,14 @@ app.post('/proxy', async (req, res) => {
   try {
     const authHeader = req.headers['authorization'] || '';
 
-    // Dùng Axios gửi binary qua Hugging Face với Timeout 2 phút
     const hfResponse = await axios.post(
       'https://api-inference.huggingface.co/models/openai/shap-e',
       req.body,
       {
         headers: {
           'Authorization': authHeader,
-          'Content-Type': 'image/jpeg'
+          'Content-Type': 'image/jpeg',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
         },
         responseType: 'arraybuffer',
         timeout: 120000 // Chờ tối đa 120 giây
@@ -31,7 +35,6 @@ app.post('/proxy', async (req, res) => {
 
   } catch (err) {
     if (err.response) {
-      // Trả lại nguyên vẹn mã lỗi (vd: 503 khi AI đang ngủ) từ Hugging Face về cho SketchUp
       res.setHeader('Content-Type', err.response.headers['content-type'] || 'application/json');
       return res.status(err.response.status).send(err.response.data);
     }
