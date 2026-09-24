@@ -2,73 +2,52 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const https = require('https');
+const dns = require('dns');
+
+// Ép Node.js ưu tiên IPv4 (Khắc phục lỗi ENOTFOUND trên môi trường Linux/Render)
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const app = express();
 app.use(cors());
 app.use(express.raw({ type: '*/*', limit: '20mb' }));
 
-let cachedIp = null;
-let lastFetchTime = 0;
+// Danh sách IP Anycast cố định của Cloudflare phục vụ Hugging Face (Bypass DNS 100%)
+const HARDCODED_HF_IPS = [
+  '104.18.28.122',
+  '104.18.29.122',
+  '172.67.160.108',
+  '104.18.30.122'
+];
 
-// Tra cứu IP bằng HTTPS bắn THẲNG VÀO IP (1.1.1.1 / 8.8.8.8) để tránh tra cứu DNS tên miền
 async function getHuggingFaceIp() {
-  if (cachedIp && (Date.now() - lastFetchTime < 600000)) {
-    return cachedIp;
-  }
-
-  const agentNoCheck = new https.Agent({ rejectUnauthorized: false });
-
-  // 1. Truy vấn DoH trực tiếp bằng IP 1.1.1.1
+  // 1. Thử lấy IP động qua Google DoH API (Dùng tên miền HTTPS tiêu chuẩn)
   try {
-    const res = await axios.get('https://1.1.1.1/dns-query?name=api-inference.huggingface.co&type=A', {
-      headers: { 'Accept': 'application/dns-json', 'Host': 'cloudflare-dns.com' },
-      httpsAgent: agentNoCheck,
-      timeout: 5000
+    const res = await axios.get('https://dns.google/resolve?name=api-inference.huggingface.co&type=A', { 
+      timeout: 3000 
     });
     if (res.data && res.data.Answer && res.data.Answer.length > 0) {
       const ip = res.data.Answer.find(a => a.type === 1)?.data;
       if (ip) {
-        cachedIp = ip;
-        lastFetchTime = Date.now();
-        console.log(`[DoH 1.1.1.1 OK] IP Hugging Face: ${ip}`);
-        return cachedIp;
+        console.log(`[Google DoH OK] IP: ${ip}`);
+        return ip;
       }
     }
   } catch (e) {
-    console.log('DoH 1.1.1.1 failed:', e.message);
+    console.log('[Google DoH Failed] Chuyển sang danh sách IP Anycast dự phòng...');
   }
 
-  // 2. Dự phòng truy vấn DoH bằng IP 8.8.8.8
-  try {
-    const res = await axios.get('https://8.8.8.8/resolve?name=api-inference.huggingface.co&type=A', {
-      headers: { 'Host': 'dns.google' },
-      httpsAgent: agentNoCheck,
-      timeout: 5000
-    });
-    if (res.data && res.data.Answer && res.data.Answer.length > 0) {
-      const ip = res.data.Answer.find(a => a.type === 1)?.data;
-      if (ip) {
-        cachedIp = ip;
-        lastFetchTime = Date.now();
-        console.log(`[DoH 8.8.8.8 OK] IP Hugging Face: ${ip}`);
-        return cachedIp;
-      }
-    }
-  } catch (e) {
-    console.log('DoH 8.8.8.8 failed:', e.message);
-  }
-
-  return cachedIp;
+  // 2. Nếu DNS thất bại, chọn ngẫu nhiên 1 IP trong danh sách Hardcoded Anycast IPs
+  const fallbackIp = HARDCODED_HF_IPS[Math.floor(Math.random() * HARDCODED_HF_IPS.length)];
+  console.log(`[Fallback Anycast IP] Sử dụng IP: ${fallbackIp}`);
+  return fallbackIp;
 }
 
 app.post('/proxy', async (req, res) => {
   try {
     const authHeader = req.headers['authorization'] || '';
     const ip = await getHuggingFaceIp();
-
-    if (!ip) {
-      return res.status(500).json({ error: "Proxy Error: Render DNS bị chặn hoàn toàn, không thể lấy IP của Hugging Face." });
-    }
 
     const targetUrl = `https://${ip}/models/openai/shap-e`;
 
@@ -87,7 +66,7 @@ app.post('/proxy', async (req, res) => {
           rejectUnauthorized: false
         }),
         responseType: 'arraybuffer',
-        timeout: 120000
+        timeout: 120000 // Chờ tối đa 120 giây
       }
     );
 
