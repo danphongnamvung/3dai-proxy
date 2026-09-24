@@ -3,7 +3,12 @@ const cors = require('cors');
 const axios = require('axios');
 const dns = require('dns');
 
-// Ép Node.js ưu tiên phân giải tên miền qua IPv4 (Sửa triệt để lỗi ENOTFOUND trên Render)
+// 1. Ép Node.js dùng DNS của Google & Cloudflare (Sửa triệt để lỗi ENOTFOUND trên Render)
+try {
+  dns.setServers(['8.8.8.8', '1.1.1.1']);
+} catch (e) {
+  console.log('Không thể đặt custom DNS servers:', e.message);
+}
 dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
@@ -35,6 +40,7 @@ app.post('/proxy', async (req, res) => {
 
   } catch (err) {
     if (err.response) {
+      // Trả lại đúng phản hồi từ Hugging Face (kể cả mã 503 khi AI đang khởi động)
       res.setHeader('Content-Type', err.response.headers['content-type'] || 'application/json');
       return res.status(err.response.status).send(err.response.data);
     }
