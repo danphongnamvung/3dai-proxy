@@ -1,25 +1,57 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const dns = require('dns');
-
-// 1. Ép Node.js dùng DNS của Google & Cloudflare (Sửa triệt để lỗi ENOTFOUND trên Render)
-try {
-  dns.setServers(['8.8.8.8', '1.1.1.1']);
-} catch (e) {
-  console.log('Không thể đặt custom DNS servers:', e.message);
-}
-dns.setDefaultResultOrder('ipv4first');
+const https = require('https');
 
 const app = express();
 app.use(cors());
-
-// Nhận dữ liệu ảnh thô từ SketchUp (tối đa 20MB)
 app.use(express.raw({ type: '*/*', limit: '20mb' }));
+
+// Bộ nhớ đệm lưu IP để tránh tra cứu DoH liên tục
+let cachedIp = null;
+let lastFetchTime = 0;
+
+// Tra cứu IP của Hugging Face qua cổng HTTPS 443 (Bypass triệt để DNS Render)
+async function getHuggingFaceIp() {
+  if (cachedIp && (Date.now() - lastFetchTime < 600000)) { // Cache trong 10 phút
+    return cachedIp;
+  }
+
+  try {
+    const res = await axios.get('https://cloudflare-dns.com/dns-query?name=api-inference.huggingface.co&type=A', {
+      headers: { 'Accept': 'application/dns-json' },
+      timeout: 5000
+    });
+
+    if (res.data && res.data.Answer && res.data.Answer.length > 0) {
+      cachedIp = res.data.Answer.find(a => a.type === 1)?.data || res.data.Answer[0].data;
+      lastFetchTime = Date.now();
+      console.log(`[DoH Success] IP Hugging Face: ${cachedIp}`);
+      return cachedIp;
+    }
+  } catch (e) {
+    console.error('[DoH Error] Không thể lấy IP qua DoH:', e.message);
+  }
+  return null;
+}
 
 app.post('/proxy', async (req, res) => {
   try {
     const authHeader = req.headers['authorization'] || '';
+    const resolvedIp = await getHuggingFaceIp();
+
+    // Ép Axios kết nối trực tiếp tới IP đã phân giải qua DoH
+    const agentOptions = { keepAlive: true };
+    if (resolvedIp) {
+      agentOptions.lookup = (hostname, options, cb) => {
+        if (hostname === 'api-inference.huggingface.co') {
+          return cb(null, resolvedIp, 4);
+        }
+        require('dns').lookup(hostname, options, cb);
+      };
+    }
+
+    const httpsAgent = new https.Agent(agentOptions);
 
     const hfResponse = await axios.post(
       'https://api-inference.huggingface.co/models/openai/shap-e',
@@ -30,6 +62,7 @@ app.post('/proxy', async (req, res) => {
           'Content-Type': 'image/jpeg',
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
         },
+        httpsAgent: httpsAgent,
         responseType: 'arraybuffer',
         timeout: 120000 // Chờ tối đa 120 giây
       }
@@ -40,7 +73,6 @@ app.post('/proxy', async (req, res) => {
 
   } catch (err) {
     if (err.response) {
-      // Trả lại đúng phản hồi từ Hugging Face (kể cả mã 503 khi AI đang khởi động)
       res.setHeader('Content-Type', err.response.headers['content-type'] || 'application/json');
       return res.status(err.response.status).send(err.response.data);
     }
