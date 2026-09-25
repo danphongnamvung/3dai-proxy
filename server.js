@@ -4,67 +4,58 @@ const axios = require('axios');
 const https = require('https');
 const dns = require('dns');
 
-// Ép Node.js ưu tiên IPv4 (Khắc phục lỗi ENOTFOUND trên môi trường Linux/Render)
-if (dns.setDefaultResultOrder) {
-  dns.setDefaultResultOrder('ipv4first');
-}
-
 const app = express();
 app.use(cors());
 app.use(express.raw({ type: '*/*', limit: '20mb' }));
 
-// Danh sách IP Anycast cố định của Cloudflare phục vụ Hugging Face (Bypass DNS 100%)
-const HARDCODED_HF_IPS = [
-  '104.18.28.122',
-  '104.18.29.122',
-  '172.67.160.108',
-  '104.18.30.122'
-];
+// Danh sách IP dự phòng của Cloudflare cho Hugging Face
+const FALLBACK_IPS = ['104.18.28.122', '104.18.29.122', '172.67.160.108'];
 
-async function getHuggingFaceIp() {
-  // 1. Thử lấy IP động qua Google DoH API (Dùng tên miền HTTPS tiêu chuẩn)
-  try {
-    const res = await axios.get('https://dns.google/resolve?name=api-inference.huggingface.co&type=A', { 
-      timeout: 3000 
-    });
-    if (res.data && res.data.Answer && res.data.Answer.length > 0) {
-      const ip = res.data.Answer.find(a => a.type === 1)?.data;
-      if (ip) {
-        console.log(`[Google DoH OK] IP: ${ip}`);
-        return ip;
+// Hàm tự phân giải IP bằng DNS Server độc lập (Google 8.8.8.8)
+function resolveHFDomain() {
+  return new Promise((resolve) => {
+    const resolver = new dns.Resolver();
+    resolver.setServers(['8.8.8.8', '1.1.1.1']);
+    
+    resolver.resolve4('api-inference.huggingface.co', (err, addresses) => {
+      if (!err && addresses && addresses.length > 0) {
+        console.log(`[Google DNS OK] IP: ${addresses[0]}`);
+        return resolve(addresses[0]);
       }
-    }
-  } catch (e) {
-    console.log('[Google DoH Failed] Chuyển sang danh sách IP Anycast dự phòng...');
-  }
-
-  // 2. Nếu DNS thất bại, chọn ngẫu nhiên 1 IP trong danh sách Hardcoded Anycast IPs
-  const fallbackIp = HARDCODED_HF_IPS[Math.floor(Math.random() * HARDCODED_HF_IPS.length)];
-  console.log(`[Fallback Anycast IP] Sử dụng IP: ${fallbackIp}`);
-  return fallbackIp;
+      // Nếu DNS bị Render chặn hoàn toàn, dùng IP Anycast dự phòng
+      const randomIp = FALLBACK_IPS[Math.floor(Math.random() * FALLBACK_IPS.length)];
+      console.log(`[Fallback IP] IP: ${randomIp}`);
+      resolve(randomIp);
+    });
+  });
 }
 
 app.post('/proxy', async (req, res) => {
   try {
     const authHeader = req.headers['authorization'] || '';
-    const ip = await getHuggingFaceIp();
+    const targetIp = await resolveHFDomain();
 
-    const targetUrl = `https://${ip}/models/openai/shap-e`;
+    // Ép TCP kết nối theo IP nhưng giữ tên miền cho TLS SNI (Sửa triệt để lỗi SSL 500)
+    const customAgent = new https.Agent({
+      keepAlive: true,
+      lookup: (hostname, options, callback) => {
+        if (hostname === 'api-inference.huggingface.co') {
+          return callback(null, targetIp, 4);
+        }
+        dns.lookup(hostname, options, callback);
+      }
+    });
 
     const hfResponse = await axios.post(
-      targetUrl,
+      'https://api-inference.huggingface.co/models/openai/shap-e',
       req.body,
       {
         headers: {
-          'Host': 'api-inference.huggingface.co',
           'Authorization': authHeader,
           'Content-Type': 'image/jpeg',
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
         },
-        httpsAgent: new https.Agent({
-          servername: 'api-inference.huggingface.co',
-          rejectUnauthorized: false
-        }),
+        httpsAgent: customAgent,
         responseType: 'arraybuffer',
         timeout: 120000 // Chờ tối đa 120 giây
       }
