@@ -8,22 +8,20 @@ const app = express();
 app.use(cors());
 app.use(express.raw({ type: '*/*', limit: '20mb' }));
 
-// Danh sách IP dự phòng của Cloudflare cho Hugging Face
+const DEFAULT_IP = '104.18.28.122';
 const FALLBACK_IPS = ['104.18.28.122', '104.18.29.122', '172.67.160.108'];
 
-// Hàm tự phân giải IP bằng DNS Server độc lập (Google 8.8.8.8)
-function resolveHFDomain() {
+function getValidIp() {
   return new Promise((resolve) => {
     const resolver = new dns.Resolver();
     resolver.setServers(['8.8.8.8', '1.1.1.1']);
     
     resolver.resolve4('api-inference.huggingface.co', (err, addresses) => {
       if (!err && addresses && addresses.length > 0) {
-        console.log(`[Google DNS OK] IP: ${addresses[0]}`);
+        console.log(`[DNS Resolved] IP: ${addresses[0]}`);
         return resolve(addresses[0]);
       }
-      // Nếu DNS bị Render chặn hoàn toàn, dùng IP Anycast dự phòng
-      const randomIp = FALLBACK_IPS[Math.floor(Math.random() * FALLBACK_IPS.length)];
+      const randomIp = FALLBACK_IPS[Math.floor(Math.random() * FALLBACK_IPS.length)] || DEFAULT_IP;
       console.log(`[Fallback IP] IP: ${randomIp}`);
       resolve(randomIp);
     });
@@ -33,16 +31,17 @@ function resolveHFDomain() {
 app.post('/proxy', async (req, res) => {
   try {
     const authHeader = req.headers['authorization'] || '';
-    const targetIp = await resolveHFDomain();
+    const targetIp = await getValidIp();
 
-    // Ép TCP kết nối theo IP nhưng giữ tên miền cho TLS SNI (Sửa triệt để lỗi SSL 500)
+    // Xử lý đúng cấu trúc Overloading của Node.js dns.lookup
     const customAgent = new https.Agent({
       keepAlive: true,
       lookup: (hostname, options, callback) => {
+        const actualCallback = typeof options === 'function' ? options : callback;
         if (hostname === 'api-inference.huggingface.co') {
-          return callback(null, targetIp, 4);
+          return actualCallback(null, targetIp, 4);
         }
-        dns.lookup(hostname, options, callback);
+        return dns.lookup(hostname, options, actualCallback);
       }
     });
 
